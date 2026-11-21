@@ -657,13 +657,55 @@ function readClaudeFileToken() {
   return { token: oauth.accessToken, plan: planLabel(oauth.subscriptionType) };
 }
 
-function decryptChromeCookie(encryptedValue, key) {
+function decryptChromeCookie(encryptedValue, key, hashed = true) {
   const buf = Buffer.isBuffer(encryptedValue) ? encryptedValue : Buffer.from(encryptedValue);
   if (buf.subarray(0, 3).toString() !== "v10") throw new Error("cookie no es v10");
   const iv = Buffer.alloc(16, " ");
   const decipher = createDecipheriv("aes-128-cbc", key, iv);
   const plain = Buffer.concat([decipher.update(buf.subarray(3)), decipher.final()]);
-  return plain.subarray(32).toString("utf8").replace(/\0+$/, "").replace(/^[^\x20-\x7E]+/, "");
+  // Desde la versión 24 de la base, Chromium antepone 32 bytes de hash del dominio.
+  return (hashed ? plain.subarray(32) : plain)
+    .toString("utf8")
+    .replace(/\0+$/, "")
+    .replace(/^[^\x20-\x7E]+/, "");
+}
+
+// Claude Desktop guarda las cookies en Cookies o, en versiones nuevas, en Network/Cookies.
+function claudeCookiesPath() {
+  const base = path.join(os.homedir(), "Library/Application Support/Claude");
+  const found = [path.join(base, "Network", "Cookies"), path.join(base, "Cookies")]
+    .filter((file) => fs.existsSync(file))
+    .map((file) => ({ file, at: fs.statSync(file).mtimeMs }))
+    .sort((a, b) => b.at - a.at);
+  return found[0]?.file || null;
+}
+
+// Con Claude abierto, la base puede estar bloqueada. Se lee una copia y se borra.
+function withCookiesCopy(file, read) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "consumo-"));
+  try {
+    const copy = path.join(dir, "Cookies");
+    fs.copyFileSync(file, copy);
+    for (const suffix of ["-wal", "-journal"]) {
+      if (fs.existsSync(file + suffix)) fs.copyFileSync(file + suffix, copy + suffix);
+    }
+    const db = new DatabaseSync(copy);
+    try {
+      return read(db);
+    } finally {
+      db.close();
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function keychainError() {
+  const err = new Error(
+    "macOS no ha dejado leer la sesión de Claude. Pulsa Actualizar y, cuando salga el aviso del llavero, escribe la contraseña del Mac y pulsa Permitir siempre.",
+  );
+  err.code = "keychain";
+  return err;
 }
 
 function readClaudeDesktopSession() {
@@ -671,32 +713,46 @@ function readClaudeDesktopSession() {
   if (claudeSession.cookieHeader && Date.now() - claudeSession.at < 10 * 60 * 1000) {
     return claudeSession;
   }
-  const cookiesPath = path.join(os.homedir(), "Library/Application Support/Claude/Cookies");
-  if (!fs.existsSync(cookiesPath)) return null;
-  const password = execFileSync(
-    "security",
-    ["find-generic-password", "-w", "-s", "Claude Safe Storage", "-a", "Claude Key"],
-    { encoding: "utf8" },
-  ).trim();
-  const key = pbkdf2Sync(password, "saltysalt", 1003, 16, "sha1");
-  const db = new DatabaseSync(cookiesPath, { readOnly: true });
-  let rows;
+  const cookiesPath = claudeCookiesPath();
+  if (!cookiesPath) return null;
+  let password;
   try {
-    rows = db
+    password = execFileSync(
+      "security",
+      ["find-generic-password", "-w", "-s", "Claude Safe Storage", "-a", "Claude Key"],
+      { encoding: "utf8", timeout: 60_000 },
+    ).trim();
+  } catch {
+    throw keychainError();
+  }
+  const key = pbkdf2Sync(password, "saltysalt", 1003, 16, "sha1");
+  const { rows, version } = withCookiesCopy(cookiesPath, (db) => {
+    let version = 0;
+    try {
+      version = Number(db.prepare("SELECT value FROM meta WHERE key = 'version'").get()?.value) || 0;
+    } catch {
+      // sin versión, se asume la actual
+    }
+    const rows = db
       .prepare("SELECT name, encrypted_value FROM cookies WHERE host_key LIKE '%claude%'")
       .all();
-  } finally {
-    db.close();
-  }
+    return { rows, version };
+  });
+  const hashed = !version || version >= 24;
   const cookies = {};
   for (const row of rows) {
     try {
-      cookies[row.name] = decryptChromeCookie(row.encrypted_value, key);
+      cookies[row.name] = decryptChromeCookie(row.encrypted_value, key, hashed);
     } catch {
       // una cookie ilegible no invalida el resto
     }
   }
-  if (!cookies.sessionKey || !cookies.lastActiveOrg) return null;
+  if (!cookies.sessionKey) return null;
+  if (!cookies.lastActiveOrg) {
+    const err = new Error("Claude Desktop tiene sesión, pero no sé qué organización mirar. Abre Claude, entra en un chat y pulsa Actualizar.");
+    err.code = "org";
+    throw err;
+  }
   claudeSession = {
     at: Date.now(),
     cookieHeader: Object.entries(cookies)
@@ -774,26 +830,35 @@ async function loadClaude() {
     let session;
     try {
       session = readClaudeDesktopSession();
-    } catch {
-      throw new Error(
-        "macOS quiere confirmar que puedes ver Claude. Cuando salga el aviso, pulsa Permitir y luego Actualizar.",
-      );
+    } catch (error) {
+      if (error.code === "keychain" || error.code === "org") throw error;
+      throw new Error(`No he podido leer la sesión de Claude Desktop (${safeMessage(error)}).`);
     }
     if (!session) {
       throw new Error(
         "No encuentro Claude Desktop. Ábrelo, inicia sesión y pulsa Actualizar. Si solo usas Claude Code, también vale esa sesión.",
       );
     }
-    usage = await fetchJson(`https://claude.ai/api/organizations/${session.org}/usage`, {
-      headers: {
-        Cookie: session.cookieHeader,
-        Referer: "https://claude.ai/settings/usage",
-        Origin: "https://claude.ai",
-        Accept: "application/json",
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      },
-    });
+    try {
+      usage = await fetchJson(`https://claude.ai/api/organizations/${session.org}/usage`, {
+        headers: {
+          Cookie: session.cookieHeader,
+          Referer: "https://claude.ai/settings/usage",
+          Origin: "https://claude.ai",
+          Accept: "application/json",
+          "User-Agent":
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        },
+      });
+    } catch (error) {
+      claudeSession = { at: 0, cookieHeader: "", org: "" };
+      if (error.status === 401 || error.status === 403) {
+        throw new Error(
+          `claude.ai no ha aceptado la sesión de Claude Desktop (HTTP ${error.status}). Cierra Claude del todo, ábrelo, entra en un chat y pulsa Actualizar.`,
+        );
+      }
+      throw error;
+    }
     source = "Sesión de Claude Desktop";
   }
 
@@ -956,18 +1021,18 @@ function claudeFileState() {
 
 function claudeDesktopHasSession() {
   if (process.platform !== "darwin") return false;
-  const cookiesPath = path.join(os.homedir(), "Library/Application Support/Claude/Cookies");
-  if (!fs.existsSync(cookiesPath)) return false;
-  const db = new DatabaseSync(cookiesPath, { readOnly: true });
+  const cookiesPath = claudeCookiesPath();
+  if (!cookiesPath) return false;
   try {
-    const row = db
-      .prepare("SELECT name FROM cookies WHERE name = 'sessionKey' AND host_key LIKE '%claude%'")
-      .get();
-    return Boolean(row);
+    return withCookiesCopy(cookiesPath, (db) =>
+      Boolean(
+        db
+          .prepare("SELECT name FROM cookies WHERE name = 'sessionKey' AND host_key LIKE '%claude%'")
+          .get(),
+      ),
+    );
   } catch {
     return false;
-  } finally {
-    db.close();
   }
 }
 

@@ -1159,7 +1159,8 @@
               <div class="card-side">${liveBadge(state.on, state.title)}${tool.plan ? `<div class="plan">${escapeHtml(tool.plan)}</div>` : ""}</div>
             </div>`;
           if (!tool.ok || !hero) {
-            return `<article data-id="${tool.id}">${head}<p class="hero-num">—</p></article>`;
+            const why = !tool.ok && tool.error ? `<p class="error">${escapeHtml(friendlyError(tool.error))}</p>` : "";
+            return `<article data-id="${tool.id}">${head}<p class="hero-num">—</p>${why}</article>`;
           }
           const rows = tool.meters.map((row) => {
             const level = tone(row.used);
