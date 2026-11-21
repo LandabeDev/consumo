@@ -333,6 +333,7 @@
       }
       .notice strong { color: var(--ink); font-family: var(--font-bold); font-weight: 700; }
       .settings-note { margin: 16px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+      .settings-note a { color: inherit; }
       .picker { margin-top: var(--stack); display: grid; gap: var(--gap); }
       .choice {
         display: grid;
@@ -581,6 +582,8 @@
       .meter-key span { width: auto; }
       .note, .detail, .source, .error { margin: 14px 0 0; font-size: 14px; line-height: 1.45; color: var(--body); }
       .detail { color: var(--bad); }
+      .forecast { margin: 14px 0 0; font-size: 14px; line-height: 1.45; color: var(--body); }
+      .forecast.soon { color: var(--bad); }
       .error { font-size: 15px; margin-top: 22px; color: var(--ink); }
       footer { margin-top: 28px; }
       footer a {
@@ -795,6 +798,7 @@
         <p class="settings-note">
           Los números salen de la sesión ya abierta aquí. No se guardan claves en esta carpeta.
           El puerto se cambia en <code>config.json</code> si lo necesitas.
+          El historial de cupos se guarda solo en este equipo: <a href="/api/history.csv" download>bajarlo en CSV</a>.
         </p>
       </section>
 
@@ -1084,12 +1088,28 @@
         </div>`).join("");
       }
 
+      function forecastsOf(tool) {
+        if (!tool.ok) return [];
+        const hero = heroOf(tool);
+        return tool.meters.filter((row) => row.forecast?.text && (row === hero || row.forecast.beforeReset));
+      }
+
+      function renderForecasts(tool) {
+        return forecastsOf(tool).map((row) => {
+          const label = row === heroOf(tool) ? "" : `<strong>${escapeHtml(row.label)}.</strong> `;
+          return `<p class="forecast${row.forecast.beforeReset ? " soon" : ""}">${label}${escapeHtml(row.forecast.text)}</p>`;
+        }).join("");
+      }
+
       function toolLines(tool) {
         if (!tool.ok) return [friendlyError(tool.error)];
         const hero = heroOf(tool);
         const lines = [];
         const alert = warning(tool, hero);
         if (alert) lines.push(alert);
+        for (const row of forecastsOf(tool)) {
+          if (row.forecast.beforeReset) lines.push(`${row.label}: ${row.forecast.text}`);
+        }
         const reset = hero?.reset
           ? `${hero.reset.charAt(0).toUpperCase()}${hero.reset.slice(1)}.`
           : tool.note;
@@ -1106,6 +1126,8 @@
           ? ""
           : worst >= 95
             ? "Alguna suscripción está al límite."
+            : data.tools.some((tool) => forecastsOf(tool).some((row) => row.forecast.beforeReset))
+              ? "A este ritmo, alguna se acaba antes de reiniciarse."
             : worst >= 80
               ? "Vas justo en alguna."
               : "Vas con margen en lo que has elegido.";
@@ -1153,6 +1175,7 @@
             ${head}
             <p class="hero-num">${formatPct(hero.left)}<small>queda ${escapeHtml(LEFT_OF[hero.label] || "en esta ventana")}</small></p>
             <div class="meters"><div class="meter-key">usado</div>${rows}</div>
+            ${renderForecasts(tool)}
             ${renderChartBlock(tool)}
             <div class="folds">
               ${fold(tool.id, "modelos", "Modelos", total, tool.history?.models)}

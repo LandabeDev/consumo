@@ -86,6 +86,23 @@ Arriba a la derecha:
 - **theme.** Familia (Actual, Editorial, Sistema, Mono o una de Google Fonts), versión **light** / **dark**, colores y espacio (Compacto, Normal, Amplio, Extendido). **Volver al tema** restaura el aspecto original. El campo vacío de Google Fonts vuelve a la familia de ahora.
 - **ajustes.** Avisos, cada cuánto se refresca, **Cambiar cuentas** y la nota de que las claves no se guardan aquí.
 
+## Previsión y avisos
+
+Cada lectura se guarda en `data/consumo.sqlite`, dentro de esta carpeta. Solo el porcentaje usado de cada barra y cuándo se reinicia: ni claves, ni correos, ni conversaciones.
+
+Con eso el panel calcula el ritmo de las últimas horas y lo dice debajo de las barras:
+
+- **A este ritmo se acaba en 3 h, el 21 nov, 18:00.** Sale en rojo si se acaba antes de que se reinicie.
+- **A este ritmo llegas al reinicio con un 40 % libre.** Vas bien.
+
+Hace falta un rato de datos: con menos de 15 minutos de lecturas no se calcula nada.
+
+Mientras el servidor esté en marcha, también avisa con una notificación del sistema (macOS y Linux) cuando una barra pasa del 80 %, del 95 % o se agota, y cuando se reinicia después de haber estado justa. Cada nivel avisa una sola vez.
+
+Aunque cierres la pestaña, el servidor sigue mirando cada 5 minutos las cuentas que elegiste, para que el historial y los avisos no se corten. Si todavía no has elegido cuentas, no mira nada. Si usas Claude Desktop, en el aviso del llavero pulsa **Permitir siempre** para que no te lo vuelva a pedir.
+
+En **ajustes** hay un enlace para bajar el historial en CSV. Para borrarlo, para el servidor y borra la carpeta `data`.
+
 ## Si una tarjeta no carga
 
 - **Cursor.** Abre Cursor e inicia sesión. La sesión se lee de la base local de Cursor (`state.vscdb`), no de un token que tengas que pegar.
@@ -109,6 +126,11 @@ cp config.example.json config.json
 | `port` | Puerto local. Por defecto `3851`. |
 | `refreshSeconds` | Cada cuánto se actualiza solo. Mínimo 15. |
 | `tools` | Respaldo si alguien llama a la API sin elegir. En el navegador manda la pantalla inicial. |
+| `history` | Guardar el historial y calcular la previsión. Por defecto `true`. |
+| `notify` | Notificaciones del sistema. Por defecto `true`. También se apagan con `NO_NOTIFY=1`. |
+| `backgroundMinutes` | Cada cuántos minutos mira con la pestaña cerrada. Por defecto `5`. `0` lo apaga. |
+
+El historial puede ir a otra carpeta con `CONSUMO_DATA=/ruta node server.js`.
 
 `config.json` no se sube a Git. Cada persona tiene el suyo.
 
@@ -130,6 +152,12 @@ curl http://127.0.0.1:3851/api/health
 
 Tiene que responder `{"ok":true}`.
 
+Para comprobar el cálculo de la previsión y de los avisos, sin tocar ninguna cuenta:
+
+```bash
+npm test
+```
+
 ## Actualizarlo
 
 Dentro de la carpeta, con el servidor parado:
@@ -147,5 +175,7 @@ Si lo bajaste en ZIP, descarga el ZIP nuevo y sustituye la carpeta. `config.json
 - Claude: la sesión de Claude Desktop (en Mac, con permiso del llavero) o la de Claude Code, y el uso de claude.ai o de la API de sesión.
 - Codex: `~/.codex/auth.json` y el uso de la cuenta de ChatGPT. No la API key de OpenAI.
 - En el navegador se guarda qué cuentas miras, en qué orden, y el tema. Solo en ese navegador.
+- En `data/consumo.sqlite` se guarda el porcentaje usado de cada barra, con su hora, y qué cuentas elegiste. No sale de este equipo.
+- El panel solo contesta si lo abres como `127.0.0.1` o `localhost`. Otra web no puede leerlo aunque apunte a tu equipo.
 
 No pegues tokens en esta carpeta. No hace falta `.env`.

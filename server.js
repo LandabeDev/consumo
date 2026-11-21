@@ -6,6 +6,8 @@ import { execFileSync } from "node:child_process";
 import { createDecipheriv, pbkdf2Sync } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
+import { openHistory } from "./history.js";
+import { systemNotify } from "./notify.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -35,6 +37,9 @@ function readConfig() {
     port: 3851,
     refreshSeconds: 30,
     tools: ["cursor", "claude", "codex"],
+    history: true,
+    notify: true,
+    backgroundMinutes: 5,
   };
   const file = path.join(__dirname, "config.json");
   if (!fs.existsSync(file)) return defaults;
@@ -44,11 +49,16 @@ function readConfig() {
       ? raw.tools.filter((id) => defaults.tools.includes(id))
       : defaults.tools;
     const refresh = Number(raw.refreshSeconds);
+    const background = Number(raw.backgroundMinutes);
     return {
       port: Number(raw.port) || defaults.port,
       refreshSeconds:
         Number.isFinite(refresh) && refresh >= 15 ? refresh : defaults.refreshSeconds,
       tools: tools.length ? tools : defaults.tools,
+      history: raw.history !== false,
+      notify: raw.notify !== false,
+      backgroundMinutes:
+        Number.isFinite(background) && background >= 0 ? background : defaults.backgroundMinutes,
     };
   } catch {
     return defaults;
@@ -482,6 +492,13 @@ function meter(label, used, extra = {}) {
   };
 }
 
+function toMs(value) {
+  if (value == null || value === "") return null;
+  const n = Number(value);
+  const ms = Number.isFinite(n) ? (n < 1e12 ? n * 1000 : n) : Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 function formatWhen(isoOrMs) {
   const date = new Date(isoOrMs);
   if (Number.isNaN(date.getTime())) return null;
@@ -590,10 +607,11 @@ async function loadCursor() {
   const onDemand = summary.individualUsage?.onDemand || {};
   const cycleEnd = summary.billingCycleEnd || period.billingCycleEnd;
 
+  const cycle = { resetAt: toMs(cycleEnd) };
   const meters = [
-    meter("Uso incluido", total),
-    meter("API incluida", api),
-    meter("Auto", auto),
+    meter("Uso incluido", total, cycle),
+    meter("API incluida", api, cycle),
+    meter("Auto", auto, cycle),
   ].filter(Boolean);
 
   const apiMeter = meters.find((row) => row.label === "API incluida");
@@ -715,7 +733,7 @@ function claudeMeters(usage) {
           : kind === "session" && row.is_active === false
             ? "empieza con el primer mensaje"
             : null;
-        return meter(label, Number(row.percent), { reset });
+        return meter(label, Number(row.percent), { reset, resetAt: toMs(row.resets_at) });
       })
       .filter(Boolean);
     if (fromLimits.length) return fromLimits;
@@ -733,7 +751,7 @@ function claudeMeters(usage) {
       const raw = Number(row.utilization);
       const used = raw <= 1 ? raw * 100 : raw;
       const reset = row.resets_at ? `se reinicia el ${formatWhen(row.resets_at)}` : null;
-      return meter(label, used, { reset });
+      return meter(label, used, { reset, resetAt: toMs(row.resets_at) });
     })
     .filter(Boolean);
 }
@@ -822,7 +840,8 @@ function windowMeter(label, window) {
     (seconds >= 6 * 24 * 3600 ? "Semana" : seconds > 0 && seconds <= 6 * 3600 ? "5 horas" : "Ventana");
   const resetMs = Number(window.reset_after_seconds) * 1000;
   const reset = Number.isFinite(resetMs) ? `se reinicia en ${formatDistance(resetMs)}` : null;
-  return meter(name, Number(window.used_percent), { reset });
+  const resetAt = Number.isFinite(resetMs) ? Date.now() + resetMs : null;
+  return meter(name, Number(window.used_percent), { reset, resetAt });
 }
 
 async function loadCodex() {
@@ -1091,12 +1110,84 @@ function toolsFromQuery(searchParams, fallback) {
   return [...new Set(picked)];
 }
 
+let history = null;
+
+function startHistory(config) {
+  if (!config.history) return null;
+  const dir = process.env.CONSUMO_DATA || path.join(__dirname, "data");
+  try {
+    return openHistory(path.join(dir, "consumo.sqlite"));
+  } catch (error) {
+    console.warn(`Sin historial: ${safeMessage(error)}`);
+    return null;
+  }
+}
+
+function forecastText(meter, forecast, now) {
+  if (!forecast) return null;
+  if (!forecast.runsOutAt) {
+    return meter.resetAt ? "Ahora mismo no estás gastando: llegas al reinicio igual." : null;
+  }
+  if (forecast.beforeReset) {
+    return `A este ritmo se acaba en ${formatDistance(forecast.runsOutAt - now)}, el ${formatWhen(forecast.runsOutAt)}.`;
+  }
+  if (forecast.leftAtReset != null) {
+    return `A este ritmo llegas al reinicio con un ${forecast.leftAtReset} % libre.`;
+  }
+  return `A este ritmo se acaba el ${formatWhen(forecast.runsOutAt)}.`;
+}
+
+function addForecasts(rows, now) {
+  if (!history) return;
+  for (const tool of rows) {
+    if (!tool.ok) continue;
+    for (const meter of tool.meters) {
+      try {
+        const forecast = history.forecast(tool.id, meter, now);
+        if (forecast) meter.forecast = { ...forecast, text: forecastText(meter, forecast, now) };
+      } catch {
+        // la previsión es opcional
+      }
+    }
+  }
+}
+
+function alertMessage(alert) {
+  const { tool, meter } = alert;
+  if (alert.kind === "reset") {
+    return { title: `${tool.name}: ${meter.label.toLowerCase()} reiniciada`, body: `Vuelves a tener un ${Math.round(meter.left)} % libre.` };
+  }
+  const title = alert.level >= 100 ? `${tool.name}: ${meter.label.toLowerCase()} agotada` : `${tool.name}: ${meter.label.toLowerCase()} al ${Math.round(meter.used)} %`;
+  const lines = [];
+  if (meter.forecast?.text && alert.level < 100) lines.push(meter.forecast.text);
+  if (meter.reset) lines.push(`${meter.reset.charAt(0).toUpperCase()}${meter.reset.slice(1)}.`);
+  return { title, body: lines.join(" ") || `Queda un ${Math.round(meter.left)} %.` };
+}
+
+function notifyChanges(config, rows) {
+  if (!history || !config.notify || process.env.NO_NOTIFY) return;
+  for (const alert of history.alerts(rows)) {
+    const { title, body } = alertMessage(alert);
+    systemNotify(title, body);
+  }
+}
+
 async function buildPayload(config, tools, fresh) {
   const key = tools.join(",");
   if (!fresh && cache.body && cache.key === key && Date.now() - cache.at < CACHE_MS) {
     return cache.body;
   }
   const rows = await Promise.all(tools.map((id) => loadTool(id)));
+  const now = Date.now();
+  if (history) {
+    try {
+      history.record(rows, now);
+      addForecasts(rows, now);
+      notifyChanges(config, rows);
+    } catch (error) {
+      console.warn(`Historial: ${safeMessage(error)}`);
+    }
+  }
   const body = {
     fetchedAt: new Date().toISOString(),
     refreshSeconds: config.refreshSeconds,
@@ -1116,9 +1207,80 @@ function send(res, status, body, type = "application/json; charset=utf-8") {
 
 const config = readConfig();
 const port = Number(process.env.PORT) || config.port;
+history = startHistory(config);
+
+function savedTools() {
+  try {
+    return toolsFromQuery(new URLSearchParams({ tools: history?.getMeta("tools") || "" }), []);
+  } catch {
+    return [];
+  }
+}
+
+function rememberTools(searchParams, tools) {
+  if (!history || !searchParams.get("tools")) return;
+  try {
+    const value = tools.join(",");
+    if (history.getMeta("tools") !== value) history.setMeta("tools", value);
+  } catch {
+    // no recordarlo solo apaga la vigilancia en segundo plano
+  }
+}
+
+function csvCell(value) {
+  const text = value == null ? "" : String(value);
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function historyCsv() {
+  const lines = ["fecha,herramienta,medidor,usado,reinicio"];
+  for (const row of history?.rows() || []) {
+    lines.push(
+      [
+        new Date(row.at).toISOString(),
+        row.tool,
+        row.meter,
+        row.used,
+        row.reset_at ? new Date(row.reset_at).toISOString() : "",
+      ]
+        .map(csvCell)
+        .join(","),
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+// Sigue mirando aunque el panel esté cerrado, para que haya historial y avisos.
+// Solo mira las cuentas que elegiste en el panel; si todavía no elegiste, no hace nada.
+function startBackground() {
+  const minutes = config.backgroundMinutes;
+  if (!history || !minutes) return;
+  const tick = async () => {
+    const tools = savedTools();
+    if (!tools.length || Date.now() - cache.at < minutes * 60 * 1000 * 0.8) return;
+    try {
+      await buildPayload(config, tools, true);
+    } catch {
+      // el siguiente intento vuelve a probar
+    }
+  };
+  setInterval(tick, minutes * 60 * 1000).unref();
+}
+
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+function isLocalHost(req) {
+  const host = String(req.headers.host || "").replace(/:\d+$/, "").toLowerCase();
+  return LOOPBACK_HOSTS.has(host);
+}
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://127.0.0.1");
+  if (!isLocalHost(req)) {
+    // otra web que apunta su dominio a 127.0.0.1 no puede leer el panel
+    send(res, 403, JSON.stringify({ error: "Solo desde este equipo." }));
+    return;
+  }
   try {
     if (url.pathname === "/api/health") {
       send(res, 200, JSON.stringify({ ok: true }));
@@ -1134,8 +1296,22 @@ const server = http.createServer(async (req, res) => {
         send(res, 400, JSON.stringify({ error: "Elige al menos una suscripción." }));
         return;
       }
+      rememberTools(url.searchParams, tools);
       const body = await buildPayload(config, tools, url.searchParams.get("fresh") === "1");
       send(res, 200, JSON.stringify(body));
+      return;
+    }
+    if (url.pathname === "/api/history.csv") {
+      if (!history) {
+        send(res, 404, JSON.stringify({ error: "El historial está apagado." }));
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": 'attachment; filename="consumo.csv"',
+        "Cache-Control": "no-store",
+      });
+      res.end(historyCsv());
       return;
     }
     if (url.pathname === "/" || url.pathname === "/index.html") {
@@ -1151,6 +1327,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(port, "127.0.0.1", () => {
   const page = `http://127.0.0.1:${port}`;
   console.log(`Consumo en ${page}`);
+  startBackground();
   if (process.platform === "darwin" && !process.env.NO_OPEN) {
     execFileSync("open", [page]);
   }

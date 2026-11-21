@@ -1,5 +1,8 @@
 {
   "port": 3851,
   "refreshSeconds": 30,
-  "tools": ["cursor", "claude", "codex"]
+  "tools": ["cursor", "claude", "codex"],
+  "history": true,
+  "notify": true,
+  "backgroundMinutes": 5
 }
