@@ -647,14 +647,56 @@ async function loadCursor() {
   };
 }
 
-function readClaudeFileToken() {
+const CLAUDE_CODE_KEYCHAIN = "Claude Code-credentials";
+
+// En macOS, Claude Code guarda la sesión en el llavero; en el resto, en ~/.claude/.credentials.json.
+function claudeCodeOauth() {
   const file = path.join(os.homedir(), ".claude", ".credentials.json");
-  if (!fs.existsSync(file)) return null;
-  const raw = JSON.parse(fs.readFileSync(file, "utf8"));
-  const oauth = raw.claudeAiOauth || {};
-  if (!oauth.accessToken) return null;
-  if (oauth.expiresAt && oauth.expiresAt < Date.now()) return null;
+  if (fs.existsSync(file)) {
+    try {
+      const oauth = JSON.parse(fs.readFileSync(file, "utf8")).claudeAiOauth;
+      if (oauth?.accessToken) return oauth;
+    } catch {
+      // se prueba el llavero
+    }
+  }
+  if (process.platform !== "darwin" || !claudeCodeInKeychain()) return null;
+  try {
+    const raw = execFileSync("security", ["find-generic-password", "-w", "-s", CLAUDE_CODE_KEYCHAIN], {
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    return JSON.parse(raw.trim()).claudeAiOauth || null;
+  } catch {
+    return null;
+  }
+}
+
+// Sin -w no lee el secreto, así que no pide permiso: solo dice si existe.
+function claudeCodeInKeychain() {
+  if (process.platform !== "darwin") return false;
+  try {
+    execFileSync("security", ["find-generic-password", "-s", CLAUDE_CODE_KEYCHAIN], {
+      stdio: "ignore",
+      timeout: 10_000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+let claudeCodeExpired = false;
+
+function readClaudeFileToken() {
+  const oauth = claudeCodeOauth();
+  claudeCodeExpired = Boolean(oauth?.accessToken && oauth.expiresAt && oauth.expiresAt < Date.now());
+  if (!oauth?.accessToken || claudeCodeExpired) return null;
   return { token: oauth.accessToken, plan: planLabel(oauth.subscriptionType) };
+}
+
+function looksLikeBotWall(error) {
+  return /cloudflare|just a moment|challenge|cf-ray|<html/i.test(String(error?.message || ""));
 }
 
 function decryptChromeCookie(encryptedValue, key, hashed = true) {
@@ -758,6 +800,7 @@ function readClaudeDesktopSession() {
     cookieHeader: Object.entries(cookies)
       .map(([name, value]) => `${name}=${value}`)
       .join("; "),
+    minimalCookie: `sessionKey=${cookies.sessionKey}; lastActiveOrg=${cookies.lastActiveOrg}`,
     org: cookies.lastActiveOrg,
   };
   return claudeSession;
@@ -812,21 +855,42 @@ function claudeMeters(usage) {
     .filter(Boolean);
 }
 
+function claudeDesktopUsage(session, cookie) {
+  return fetchJson(`https://claude.ai/api/organizations/${session.org}/usage`, {
+    headers: {
+      Cookie: cookie,
+      Referer: "https://claude.ai/settings/usage",
+      Origin: "https://claude.ai",
+      Accept: "application/json",
+      "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+      "User-Agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    },
+  });
+}
+
 async function loadClaude() {
   const fileToken = readClaudeFileToken();
   let usage = null;
   let source = null;
+  let codeError = null;
   if (fileToken) {
-    usage = await fetchJson("https://api.anthropic.com/api/oauth/usage", {
-      headers: {
-        Authorization: `Bearer ${fileToken.token}`,
-        "anthropic-beta": "oauth-2025-04-20",
-        "anthropic-version": "2023-06-01",
-        Accept: "application/json",
-      },
-    });
-    source = "Sesión de Claude Code";
-  } else {
+    try {
+      usage = await fetchJson("https://api.anthropic.com/api/oauth/usage", {
+        headers: {
+          Authorization: `Bearer ${fileToken.token}`,
+          "anthropic-beta": "oauth-2025-04-20",
+          "anthropic-version": "2023-06-01",
+          Accept: "application/json",
+        },
+      });
+      source = "Sesión de Claude Code";
+    } catch (error) {
+      // si falla, se prueba con Claude Desktop
+      codeError = error;
+    }
+  }
+  if (!usage) {
     let session;
     try {
       session = readClaudeDesktopSession();
@@ -834,30 +898,40 @@ async function loadClaude() {
       if (error.code === "keychain" || error.code === "org") throw error;
       throw new Error(`No he podido leer la sesión de Claude Desktop (${safeMessage(error)}).`);
     }
+    if (!session && codeError) throw codeError;
     if (!session) {
       throw new Error(
         "No encuentro Claude Desktop. Ábrelo, inicia sesión y pulsa Actualizar. Si solo usas Claude Code, también vale esa sesión.",
       );
     }
     try {
-      usage = await fetchJson(`https://claude.ai/api/organizations/${session.org}/usage`, {
-        headers: {
-          Cookie: session.cookieHeader,
-          Referer: "https://claude.ai/settings/usage",
-          Origin: "https://claude.ai",
-          Accept: "application/json",
-          "User-Agent":
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        },
-      });
-    } catch (error) {
-      claudeSession = { at: 0, cookieHeader: "", org: "" };
-      if (error.status === 401 || error.status === 403) {
-        throw new Error(
-          `claude.ai no ha aceptado la sesión de Claude Desktop (HTTP ${error.status}). Cierra Claude del todo, ábrelo, entra en un chat y pulsa Actualizar.`,
-        );
+      usage = await claudeDesktopUsage(session, session.cookieHeader);
+    } catch (first) {
+      // Mandar todas las cookies del navegador de Claude a veces dispara el filtro
+      // anti-bots de claude.ai. Se reintenta solo con las de la sesión.
+      try {
+        if (first.status !== 401 && first.status !== 403) throw first;
+        usage = await claudeDesktopUsage(session, session.minimalCookie);
+      } catch (error) {
+        claudeSession = { at: 0, cookieHeader: "", org: "" };
+        if (codeError) throw codeError;
+        if (claudeCodeExpired) {
+          throw new Error(
+            "La sesión de Claude Code ha caducado y claude.ai no acepta la de Claude Desktop. Abre la terminal, escribe claude, espera a que arranque, sal con /exit y pulsa Actualizar.",
+          );
+        }
+        if (looksLikeBotWall(error) || looksLikeBotWall(first)) {
+          throw new Error(
+            "claude.ai bloquea las consultas que no vienen de un navegador. Instala Claude Code y entra con tu cuenta: el panel usará esa sesión, que no tiene este bloqueo.",
+          );
+        }
+        if (error.status === 401 || error.status === 403) {
+          throw new Error(
+            `claude.ai no ha aceptado la sesión de Claude Desktop (HTTP ${error.status}). Cierra Claude del todo, ábrelo, entra en un chat y pulsa Actualizar. Si sigue igual, instala Claude Code y entra con tu cuenta.`,
+          );
+        }
+        throw error;
       }
-      throw error;
     }
     source = "Sesión de Claude Desktop";
   }
@@ -1008,7 +1082,7 @@ function probeCursor() {
 
 function claudeFileState() {
   const file = path.join(os.homedir(), ".claude", ".credentials.json");
-  if (!fs.existsSync(file)) return "none";
+  if (!fs.existsSync(file)) return claudeCodeInKeychain() ? "ready" : "none";
   try {
     const oauth = JSON.parse(fs.readFileSync(file, "utf8")).claudeAiOauth || {};
     if (!oauth.accessToken) return "none";

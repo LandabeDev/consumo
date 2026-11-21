@@ -106,7 +106,7 @@ En **ajustes** hay un enlace para bajar el historial en CSV. Para borrarlo, para
 ## Si una tarjeta no carga
 
 - **Cursor.** Abre Cursor e inicia sesión. La sesión se lee de la base local de Cursor (`state.vscdb`), no de un token que tengas que pegar.
-- **Claude.** Abre Claude Desktop e inicia sesión. Si usas Claude Code, también vale `~/.claude/.credentials.json` mientras no haya caducado. En Mac, Claude Desktop pide el llavero la primera vez: pulsa **Permitir**. En Windows y Linux esa sesión de escritorio no se lee; hace falta la de Claude Code.
+- **Claude.** Abre Claude Desktop e inicia sesión. Si usas Claude Code, también vale su sesión (en Mac está en el llavero; en Windows y Linux, en `~/.claude/.credentials.json`) mientras no haya caducado. Si la tarjeta dice que claude.ai no acepta la sesión de Claude Desktop, instala Claude Code y entra con tu cuenta: esa sesión va por otro camino y no la bloquean. En Mac, Claude Desktop pide el llavero la primera vez: pulsa **Permitir**. En Windows y Linux esa sesión de escritorio no se lee; hace falta la de Claude Code.
 - **Codex.** En la terminal, `codex login`. La sesión es `~/.codex/auth.json`. No se lee ni se muestra `OPENAI_API_KEY`.
 
 Una tarjeta en Off no apaga las otras. Pulsa **Actualizar** después de entrar en la app. Si acabas de instalarla, **Cambiar cuentas** y luego **Volver a mirar**.
